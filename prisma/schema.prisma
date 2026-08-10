@@ -1,0 +1,536 @@
+// =====================================================================
+// ArogyaX — Prisma Schema (REVISED to match current application MVP)
+// PostgreSQL + Prisma ORM
+//
+// This revision removes speculative features not used by the current
+// app (medicine substitution), tightens nullability to match actual
+// MVP business rules (vitals/vaccination always recorded by a Health
+// Worker), generalizes emergency-referral creation to any user role,
+// and adds an idempotency key for offline sync retries.
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// =====================================================================
+// ENUMS
+// =====================================================================
+
+enum UserRole {
+  PATIENT
+  DOCTOR
+  HEALTH_WORKER
+  ADMIN
+}
+
+/// How the user authenticates. OAuth (Google/Apple) is implemented in
+/// the application/auth layer, not in Prisma — this field only
+/// records which method was used so passwordHash can be nullable for
+/// OAuth-only accounts.
+enum AuthProvider {
+  EMAIL
+  GOOGLE
+  APPLE
+}
+
+enum ConsultationStatus {
+  REQUESTED
+  ACCEPTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum TriageLevel {
+  LOW
+  MODERATE
+  URGENT
+}
+
+enum VaccinationStatus {
+  SCHEDULED
+  COMPLETED
+  MISSED
+}
+
+enum ReferralStatus {
+  PENDING
+  ACCEPTED
+  IN_TRANSIT
+  ADMITTED
+  CLOSED
+}
+
+enum PrescriptionStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum FollowUpStatus {
+  SCHEDULED
+  COMPLETED
+  MISSED
+  CANCELLED
+}
+
+enum OfflineActionType {
+  REGISTER_PATIENT
+  RECORD_VITALS
+  RECORD_VACCINATION
+  CREATE_EMERGENCY_REFERRAL
+}
+
+enum OfflineActionStatus {
+  PENDING
+  SYNCED
+  FAILED
+}
+
+// =====================================================================
+// IDENTITY & ROLE PROFILES
+// =====================================================================
+
+/// Base authentication + identity record. One row per login-capable
+/// person, regardless of role. Role-specific data lives in the
+/// Patient / Doctor / HealthWorker profile tables. Admin has no
+/// additional profile table since it carries no clinical/domain data.
+///
+/// INVARIANT NOT ENFORCED BY THE DATABASE: a user's `role` must match
+/// exactly one populated profile relation (PATIENT -> patient only,
+/// DOCTOR -> doctor only, HEALTH_WORKER -> healthWorker only, ADMIN ->
+/// none). Prisma/PostgreSQL cannot express "exactly one of these
+/// optional relations is set, and only the one matching `role`" as a
+/// declarative constraint without triggers, which would add
+/// operational complexity out of proportion for this hackathon MVP.
+/// This invariant MUST be enforced in the Service/Auth layer: profile
+/// creation always happens inside the same transaction as the User
+/// creation, for the single profile type matching `role`, and no
+/// repository method should ever create a second profile type for an
+/// existing user.
+model User {
+  id           String       @id @default(uuid())
+  email        String       @unique
+  /// Nullable because Google/Apple sign-in accounts have no local
+  /// password. Required in practice only for role = EMAIL provider;
+  /// enforced at the application layer, not the database.
+  passwordHash String?
+  authProvider AuthProvider @default(EMAIL)
+  role         UserRole
+  fullName     String
+  phone        String?
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  patient      Patient?
+  doctor       Doctor?
+  healthWorker HealthWorker?
+
+  emergencyReferralsCreated EmergencyReferral[] @relation("EmergencyReferralCreatedByUser")
+
+  @@index([role])
+}
+
+/// Patient-specific profile. Owns all downstream health data.
+model Patient {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  dateOfBirth DateTime?
+  gender      String?
+  address     String?
+  village     String?
+  district    String?
+  state       String?
+  bloodGroup  String?
+
+  // Denormalized emergency contact — deliberately simple for a
+  // hackathon prototype rather than a separate contacts table.
+  emergencyContactName  String?
+  emergencyContactPhone String?
+
+  registeredByWorkerId String?
+  registeredByWorker   HealthWorker? @relation("PatientsRegistered", fields: [registeredByWorkerId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  consultations      Consultation[]
+  vitals             Vital[]
+  vaccinations       Vaccination[]
+  symptomAssessments SymptomAssessment[]
+  prescriptions      Prescription[]
+  emergencyReferrals EmergencyReferral[]
+  followUps          FollowUp[]
+
+  @@index([userId])
+  @@index([district])
+}
+
+/// Doctor-specific profile.
+model Doctor {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  specialization      String?
+  registrationNumber  String? @unique
+  yearsOfExperience   Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  consultations Consultation[]
+  prescriptions Prescription[]
+
+  @@index([userId])
+  @@index([specialization])
+}
+
+/// Community Health Worker profile.
+model HealthWorker {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  assignedArea String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  patientsRegistered   Patient[]           @relation("PatientsRegistered")
+  vitalsRecorded       Vital[]
+  vaccinationsRecorded Vaccination[]
+  emergencyReferrals   EmergencyReferral[] @relation("EmergencyReferralCreatedByWorker")
+  offlineActions       OfflineAction[]
+
+  @@index([userId])
+  @@index([assignedArea])
+}
+
+// =====================================================================
+// AI SYMPTOM TRIAGE
+// =====================================================================
+
+/// Informational triage output only. NEVER treated as a diagnosis.
+/// Deliberately decoupled from Consultation (nullable link) because a
+/// patient may run the symptom checker without ever booking a
+/// consultation, and a consultation may exist without ever having
+/// been preceded by AI triage.
+model SymptomAssessment {
+  id        String  @id @default(uuid())
+  patientId String
+  patient   Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  symptomsText      String
+  triageLevel       TriageLevel
+  aiSummary         String
+  recommendedAction String
+  providerName      String @default("mock") // e.g. "mock", future: "anthropic", "openai"
+
+  consultationId String?       @unique
+  consultation   Consultation? @relation(fields: [consultationId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([patientId])
+  @@index([triageLevel])
+}
+
+// =====================================================================
+// CONSULTATION WORKFLOW
+// =====================================================================
+
+/// Patient creates a consultation request without necessarily
+/// selecting a doctor (doctorId starts null); a doctor claims it from
+/// a shared queue by accepting, which sets doctorId + status.
+model Consultation {
+  id        String  @id @default(uuid())
+  patientId String
+  patient   Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  doctorId String?
+  doctor   Doctor? @relation(fields: [doctorId], references: [id])
+
+  status ConsultationStatus @default(REQUESTED)
+
+  reason      String?
+  doctorNotes String?
+
+  requestedAt DateTime  @default(now())
+  acceptedAt  DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  symptomAssessment SymptomAssessment?
+  prescriptions     Prescription[]
+  followUps         FollowUp[]
+
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([status])
+}
+
+// =====================================================================
+// VITALS
+// =====================================================================
+
+/// Recorded exclusively by a Health Worker in the current MVP — there
+/// is no patient self-recording workflow, so the relation is
+/// required rather than optional.
+model Vital {
+  id        String  @id @default(uuid())
+  patientId String
+  patient   Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  recordedByWorkerId String
+  recordedByWorker   HealthWorker @relation(fields: [recordedByWorkerId], references: [id])
+
+  systolicBP   Int?
+  diastolicBP  Int?
+  heartRateBpm Int?
+  temperatureC Decimal? @db.Decimal(4, 1)
+  spo2Percent  Int?
+  weightKg     Decimal? @db.Decimal(5, 2)
+  heightCm     Decimal? @db.Decimal(5, 1)
+  notes        String?
+
+  recordedAt DateTime @default(now())
+
+  @@index([patientId, recordedAt])
+  @@index([recordedByWorkerId])
+}
+
+// =====================================================================
+// VACCINATIONS
+// =====================================================================
+
+/// Recorded exclusively by a Health Worker in the current MVP — same
+/// reasoning as Vital.
+model Vaccination {
+  id        String  @id @default(uuid())
+  patientId String
+  patient   Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  recordedByWorkerId String
+  recordedByWorker   HealthWorker @relation(fields: [recordedByWorkerId], references: [id])
+
+  vaccineName      String
+  doseNumber       Int               @default(1)
+  status           VaccinationStatus @default(SCHEDULED)
+  scheduledDate    DateTime?
+  administeredDate DateTime?
+  notes            String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([patientId, status])
+  @@index([recordedByWorkerId])
+}
+
+// =====================================================================
+// MEDICINE / PRESCRIPTIONS
+// =====================================================================
+
+/// Shared medicine catalog. Kept intentionally small/simple for the
+/// hackathon prototype rather than a full drug-interaction database.
+/// Referenced by PrescriptionItem with the default (Restrict) delete
+/// behavior — a medicine must never be deletable while historical
+/// prescriptions still reference it.
+model Medicine {
+  id          String  @id @default(uuid())
+  name        String  @unique
+  genericName String?
+  form        String? // e.g. "tablet", "syrup", "injection"
+  strength    String? // e.g. "500mg"
+
+  createdAt DateTime @default(now())
+
+  prescriptionItems PrescriptionItem[]
+}
+
+model Prescription {
+  id             String       @id @default(uuid())
+  consultationId String
+  consultation   Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+
+  patientId String
+  patient   Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  doctorId String
+  doctor   Doctor @relation(fields: [doctorId], references: [id])
+
+  status   PrescriptionStatus @default(ACTIVE)
+  carePlan String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items PrescriptionItem[]
+
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([consultationId])
+}
+
+/// One line item on a prescription. Medicine substitution was removed
+/// in this revision — it is not part of the current MVP. If it is
+/// reintroduced later, add substituteMedicineId /
+/// substitutionApprovedByDoctorId / substitutionStatus back onto this
+/// model rather than a new table.
+model PrescriptionItem {
+  id             String       @id @default(uuid())
+  prescriptionId String
+  prescription   Prescription @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+
+  medicineId String
+  medicine   Medicine @relation(fields: [medicineId], references: [id])
+
+  dosage       String // e.g. "1 tablet"
+  frequency    String // e.g. "twice daily"
+  durationDays Int?
+  instructions String?
+
+  createdAt DateTime @default(now())
+
+  @@index([prescriptionId])
+  @@index([medicineId])
+}
+
+// =====================================================================
+// EMERGENCY REFERRAL
+// =====================================================================
+
+/// Simulated/demo hospital directory used as the referral destination.
+/// Clearly a synthetic catalog for the prototype, not a real
+/// facility-registry integration. Referenced by EmergencyReferral with
+/// the default (Restrict) delete behavior — historical referrals must
+/// not be silently orphaned by deleting a hospital.
+model Hospital {
+  id       String  @id @default(uuid())
+  name     String  @unique
+  address  String?
+  district String?
+  phone    String?
+  isDemo   Boolean @default(true)
+
+  createdAt DateTime @default(now())
+
+  emergencyReferrals EmergencyReferral[]
+
+  @@index([district])
+}
+
+/// Can be created by either a Patient or a Health Worker in the
+/// current MVP. `createdByUserId` is the generic, always-populated
+/// creator reference (works for either role). `createdByWorkerId` is
+/// an optional denormalized reference kept ONLY so Health-Worker-
+/// specific reporting/queues ("referrals created by my field team")
+/// can be indexed and queried directly, without joining through User
+/// -> HealthWorker every time. When the creator is a Patient,
+/// `createdByWorkerId` is left null.
+model EmergencyReferral {
+  id        String  @id @default(uuid())
+  patientId String
+  patient   Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  createdByUserId String
+  createdByUser   User   @relation("EmergencyReferralCreatedByUser", fields: [createdByUserId], references: [id])
+
+  createdByWorkerId String?
+  createdByWorker   HealthWorker? @relation("EmergencyReferralCreatedByWorker", fields: [createdByWorkerId], references: [id])
+
+  hospitalId String
+  hospital   Hospital @relation(fields: [hospitalId], references: [id])
+
+  reason                String
+  status                ReferralStatus @default(PENDING)
+  triageLevelAtReferral TriageLevel?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([patientId])
+  @@index([status])
+  @@index([createdByUserId])
+  @@index([createdByWorkerId])
+}
+
+// =====================================================================
+// FOLLOW-UP
+// =====================================================================
+
+/// No doctorId here on purpose — the owning Consultation already
+/// identifies the doctor, and duplicating it here would risk drifting
+/// out of sync if a consultation is ever reassigned.
+model FollowUp {
+  id             String       @id @default(uuid())
+  consultationId String
+  consultation   Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+
+  patientId String
+  patient   Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  scheduledFor DateTime
+  status       FollowUpStatus @default(SCHEDULED)
+  notes        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([patientId, scheduledFor])
+  @@index([consultationId])
+  @@index([status])
+}
+
+// =====================================================================
+// OFFLINE SYNCHRONIZATION (server-side audit trail)
+// =====================================================================
+
+/// Server-side record of an offline action once it has been
+/// synchronized from a Health Worker's IndexedDB queue. This table
+/// does NOT replace client-side offline storage — it is the landing
+/// record created by the backend when a queued action is replayed
+/// against the API after connectivity is restored.
+///
+/// `clientActionId` is a client-generated idempotency key (e.g. a
+/// UUID created at the moment the action is queued offline, in
+/// lib/offline/syncQueue.ts). Offline sync is inherently retry-prone —
+/// a flaky connection can cause the same queued action to be POSTed
+/// to the API more than once. Making `clientActionId` unique lets the
+/// sync endpoint safely `upsert` on it: a retried submission of the
+/// same offline action becomes a no-op instead of creating duplicate
+/// Vitals/Vaccinations/Referrals/Patients.
+model OfflineAction {
+  id             String @id @default(uuid())
+  clientActionId String @unique
+
+  healthWorkerId String
+  healthWorker   HealthWorker @relation(fields: [healthWorkerId], references: [id])
+
+  actionType OfflineActionType
+  status     OfflineActionStatus @default(PENDING)
+
+  /// Snapshot of the payload captured offline (patient registration,
+  /// vitals, vaccination, or referral data), stored as JSON so the
+  /// table doesn't need to model every possible offline payload shape.
+  payload Json
+
+  clientCreatedAt DateTime // timestamp captured on-device, offline
+  syncedAt        DateTime?
+  failureReason   String?
+
+  createdAt DateTime @default(now())
+
+  @@index([healthWorkerId, status])
+}

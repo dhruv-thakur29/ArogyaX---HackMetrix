@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 40 33% 98%;
+  --foreground: 174 30% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 174 30% 12%;
+  --muted: 40 20% 94%;
+  --muted-foreground: 174 10% 40%;
+  --border: 40 15% 87%;
+  --input: 40 15% 87%;
+  --ring: 174 60% 30%;
+  --primary: 174 62% 24%;
+  --primary-foreground: 40 33% 98%;
+  --accent: 16 72% 52%;
+  --accent-foreground: 40 33% 98%;
+  --destructive: 4 72% 48%;
+  --destructive-foreground: 0 0% 100%;
+  --success: 142 55% 32%;
+  --success-foreground: 0 0% 100%;
+  --warning: 38 85% 48%;
+  --warning-foreground: 32 40% 12%;
+  --radius: 0.75rem;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+.hero-glow {
+  background:
+    radial-gradient(600px circle at 15% 20%, hsl(var(--primary) / 0.12), transparent 60%),
+    radial-gradient(500px circle at 85% 0%, hsl(var(--accent) / 0.14), transparent 55%);
+}
