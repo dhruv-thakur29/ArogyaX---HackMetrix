@@ -39,6 +39,55 @@ export interface TriageResult {
   timestamp: string
 }
 
+export type ChatStage = 'collecting_information' | 'assessment'
+
+export interface PossibleCondition {
+  name: string
+  reason: string
+}
+
+export interface AIChatAssessment {
+  stage: ChatStage
+  riskLevel: TriageLevel
+  summary?: string
+  possibleConditions: PossibleCondition[]
+  redFlags: string[]
+  selfCareGuidance: string[]
+  recommendedAction: string
+  doctorContactRecommended: boolean
+  emergency: boolean
+  disclaimer: string
+  timestamp: string
+}
+
+export interface AIChatResponse {
+  message: string
+  stage: ChatStage
+  needsMoreInformation: boolean
+  followUpQuestion?: string
+  assessment: AIChatAssessment
+  provider: 'llama' | 'mock'
+}
+
+export interface AIChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  timestamp: string
+  assessment?: AIChatAssessment
+}
+
+export interface AIChatRequestPayload {
+  conversation: { role: 'user' | 'assistant'; content: string }[]
+  patientContext?: {
+    age?: number | null
+    gender?: string | null
+    village?: string | null
+    knownConditions?: string[]
+    medications?: string[]
+  }
+}
+
 export type ConsultationStatus =
   | 'REQUESTED'
   | 'ACCEPTED'

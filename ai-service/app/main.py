@@ -78,6 +78,39 @@ async def health_check():
         loading_error=info["loading_error"]
     )
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class PatientContext(BaseModel):
+    age: Optional[int] = None
+    sex: Optional[str] = None
+    known_conditions: Optional[List[str]] = []
+    medications: Optional[List[str]] = []
+
+class ChatRequest(BaseModel):
+    conversation: List[ChatMessage]
+    patient_context: Optional[PatientContext] = None
+
+class PossibleCondition(BaseModel):
+    name: str
+    reason: str
+
+class ChatResponse(BaseModel):
+    message: str
+    stage: str = "collecting_information"
+    needs_more_information: bool = True
+    follow_up_question: Optional[str] = None
+    risk_level: str = "LOW"
+    possible_conditions: List[PossibleCondition] = []
+    red_flags: List[str] = []
+    self_care_guidance: List[str] = []
+    recommended_action: str = ""
+    doctor_contact_recommended: bool = False
+    emergency: bool = False
+    disclaimer: str = ""
+    timestamp: str = ""
+
 @app.post("/api/v1/triage", response_model=TriageResponse)
 async def perform_triage(request: TriageRequest):
     if not request.symptoms.strip():
@@ -99,6 +132,31 @@ async def perform_triage(request: TriageRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Local model inference error: {str(e)}"
+        )
+
+@app.post("/api/v1/chat", response_model=ChatResponse)
+async def perform_chat_triage(request: ChatRequest):
+    if not request.conversation:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Conversation cannot be empty."
+        )
+
+    try:
+        conv_dicts = [{"role": m.role, "content": m.content} for m in request.conversation]
+        ctx_dict = request.patient_context.model_dump() if request.patient_context else {}
+        result = llama_model_instance.chat_symptoms(conv_dicts, ctx_dict)
+        return ChatResponse(**result)
+    except RuntimeError as rerr:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(rerr)
+        )
+    except Exception as e:
+        print(f"[ArogyaX AI Service] Error performing chat triage: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Local model inference chat error: {str(e)}"
         )
 
 if __name__ == "__main__":

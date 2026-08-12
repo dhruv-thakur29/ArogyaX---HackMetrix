@@ -1,7 +1,6 @@
 import { MockAITriageProvider } from './mock-provider'
 import { LocalLlamaProvider } from './llama-provider'
-import type { AITriageProvider } from './provider'
-import type { TriageResult } from '@/lib/types'
+import type { TriageResult, AIChatRequestPayload, AIChatResponse } from '@/lib/types'
 
 const localLlamaProvider = new LocalLlamaProvider()
 const mockProvider = new MockAITriageProvider()
@@ -19,7 +18,16 @@ const URGENT_RED_FLAGS = [
   'high fever above 103',
   'severe pain',
   'fainted',
+  'allergic reaction',
+  'anaphylaxis',
+  'coughing blood',
+  'suicidal',
+  'self-harm',
+  'self harm',
+  'numbness on one side',
+  'sudden vision loss',
 ]
+
 
 export async function analyzeSymptoms(symptoms: string): Promise<TriageResult> {
   const providerType = process.env.AI_SYMPTOM_CHECKER_PROVIDER || 'llama'
@@ -56,3 +64,56 @@ export async function analyzeSymptoms(symptoms: string): Promise<TriageResult> {
 
   return result
 }
+
+export async function chatSymptoms(
+  conversation: { role: 'user' | 'assistant'; content: string }[],
+  patientContext?: { age?: number | null; gender?: string | null; village?: string | null }
+): Promise<AIChatResponse> {
+  const providerType = process.env.AI_SYMPTOM_CHECKER_PROVIDER || 'llama'
+  const payload: AIChatRequestPayload = { conversation, patientContext }
+
+  // Check all user text in conversation for emergency red flags
+  const combinedUserText = conversation
+    .filter((m) => m.role === 'user')
+    .map((m) => m.content.toLowerCase())
+    .join(' ')
+
+  const hasRedFlag = URGENT_RED_FLAGS.some((kw) => combinedUserText.includes(kw))
+
+  let chatResponse: AIChatResponse
+
+  if (providerType === 'mock') {
+    chatResponse = await mockProvider.chat(payload)
+  } else {
+    try {
+      chatResponse = await localLlamaProvider.chat(payload)
+    } catch (err: any) {
+      console.warn(
+        `[ArogyaX AI] Local Llama chat service error or unreachable (${err.message}). Using safe Mock AI chat provider.`
+      )
+      chatResponse = await mockProvider.chat(payload)
+    }
+  }
+
+  // Deterministic Safety Override: LLM can NEVER downgrade a red flag emergency
+  if (hasRedFlag) {
+    chatResponse.stage = 'assessment'
+    chatResponse.needsMoreInformation = false
+    chatResponse.assessment = {
+      ...chatResponse.assessment,
+      stage: 'assessment',
+      riskLevel: 'URGENT',
+      emergency: true,
+      doctorContactRecommended: true,
+      recommendedAction:
+        'Red-flag warning symptoms identified! Initiate emergency referral or visit nearest hospital emergency room immediately.',
+    }
+    if (!chatResponse.message.toLowerCase().includes('emergency') && !chatResponse.message.toLowerCase().includes('urgent')) {
+      chatResponse.message =
+        '⚠️ Critical warning symptoms identified. Immediate clinical evaluation is required. Please seek emergency medical care.'
+    }
+  }
+
+  return chatResponse
+}
+

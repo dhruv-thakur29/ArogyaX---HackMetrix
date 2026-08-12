@@ -223,5 +223,114 @@ class LlamaTriageModel:
             "seekImmediateCare": seek_care
         }
 
+    def chat_symptoms(self, conversation: list, patient_context: dict = None) -> Dict[str, Any]:
+        if self.model is None or self.tokenizer is None:
+            if self.is_loading:
+                raise RuntimeError("Model is currently loading in background. Please retry in a few seconds.")
+            self.load_model()
+            if self.model is None:
+                raise RuntimeError(f"Model failed to load: {self.loading_error or 'Unknown error'}")
+
+        system_prompt = (
+            "You are ArogyaX AI Health Assistant, an intelligent preliminary health evaluation assistant.\n"
+            "You engage in an empathetic, multi-turn clinical inquiry with the user.\n"
+            "Strict Medical Rules:\n"
+            "1. NEVER make a definitive medical diagnosis or claim certainty (e.g. NEVER say 'You have X disease'). Use non-committal terms such as 'Possible causes may include' or 'This pattern can sometimes be associated with'.\n"
+            "2. NEVER prescribe medications or generate specific drug dosages.\n"
+            "3. If medication is relevant, state clearly that only a qualified doctor or licensed pharmacist can advise on medications.\n"
+            "4. Provide safe, low-risk supportive self-care guidance (e.g., hydration, adequate rest, body temperature monitoring, avoiding triggers, warm salt gargles).\n"
+            "5. If symptoms are incomplete, ask 1-2 focused, intelligent follow-up questions (e.g., exact location, duration, aggravating factors), set stage='collecting_information' and needs_more_information=true.\n"
+            "6. If enough information is gathered or user requests assessment, set stage='assessment', needs_more_information=false, list 1-3 possible causes with reasons, warning signs, and supportive care.\n"
+            "7. If critical red flags (chest pain, shortness of breath, unconsciousness, severe bleeding, stroke signs, seizure, severe allergic reaction) are present, immediately set risk_level='URGENT' and emergency=true.\n"
+            "Respond ONLY with a single valid JSON object strictly matching this schema:\n"
+            "{\n"
+            '  "message": "Conversational assistant message to the patient",\n'
+            '  "stage": "collecting_information" | "assessment",\n'
+            '  "needs_more_information": true | false,\n'
+            '  "follow_up_question": "Optional 1-2 focused follow-up questions",\n'
+            '  "risk_level": "LOW" | "MODERATE" | "URGENT",\n'
+            '  "possible_conditions": [{"name": "Possible cause name", "reason": "Why it might fit"}],\n'
+            '  "red_flags": ["Warning sign to monitor"],\n'
+            '  "self_care_guidance": ["Safe supportive recommendation"],\n'
+            '  "recommended_action": "Clear next step",\n'
+            '  "doctor_contact_recommended": true | false,\n'
+            '  "emergency": true | false\n'
+            "}"
+        )
+
+        formatted_messages = [{"role": "system", "content": system_prompt}]
+        for msg in conversation:
+            formatted_messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+
+        try:
+            formatted_prompt = self.tokenizer.apply_chat_template(
+                formatted_messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        except Exception:
+            formatted_prompt = system_prompt + "\n" + "\n".join([f"{m['role'].upper()}: {m['content']}" for m in conversation])
+
+        inputs = self.tokenizer(formatted_prompt, return_tensors="pt").to(self.model.device)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=512,
+                temperature=0.3,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+        prompt_len = inputs.input_ids.shape[1]
+        generated_tokens = outputs[0][prompt_len:]
+        raw_response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+        parsed = self._extract_json(raw_response)
+        if not parsed or "message" not in parsed:
+            parsed = self._fallback_chat_parse(raw_response, conversation)
+
+        parsed["disclaimer"] = (
+            "This AI health assistant provides preliminary informational guidance only and is NOT a medical diagnosis. "
+            "Always consult a qualified healthcare professional."
+        )
+        parsed["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return parsed
+
+    def _fallback_chat_parse(self, text: str, conversation: list) -> Dict[str, Any]:
+        last_user_msg = next((m["content"] for m in reversed(conversation) if m.get("role") == "user"), "").lower()
+        
+        is_urgent = any(w in last_user_msg for w in ["chest pain", "shortness of breath", "severe pain", "unconscious", "bleeding", "stroke"])
+        
+        if is_urgent:
+            return {
+                "message": "I detected potential warning symptoms that require immediate evaluation. Please seek emergency medical care.",
+                "stage": "assessment",
+                "needs_more_information": False,
+                "risk_level": "URGENT",
+                "possible_conditions": [{"name": "Acute Medical Condition", "reason": "Red flag symptoms reported requiring immediate evaluation."}],
+                "red_flags": ["Severe chest pain or acute difficulty breathing"],
+                "self_care_guidance": ["Keep calm and avoid physical exertion", "Seek immediate emergency transportation"],
+                "recommended_action": "Seek immediate emergency care or tap Emergency Referral.",
+                "doctor_contact_recommended": True,
+                "emergency": True
+            }
+        
+        return {
+            "message": text if text else "Thank you for sharing your symptoms. To better evaluate your situation, how long have you been experiencing these symptoms?",
+            "stage": "collecting_information",
+            "needs_more_information": True,
+            "follow_up_question": "How long have you had these symptoms and how severe are they on a scale of 1 to 10?",
+            "risk_level": "MODERATE" if any(w in last_user_msg for w in ["fever", "cough", "vomiting", "pain"]) else "LOW",
+            "possible_conditions": [{"name": "Common Viral / Seasonal Illness", "reason": "Reported symptoms match typical mild-to-moderate presentation."}],
+            "red_flags": ["Difficulty breathing or high persistent fever"],
+            "self_care_guidance": ["Stay hydrated with oral fluids", "Get sufficient rest"],
+            "recommended_action": "Monitor symptoms and consider consulting a doctor if they persist.",
+            "doctor_contact_recommended": False,
+            "emergency": False
+        }
+
 # Global singleton model instance
 llama_model_instance = LlamaTriageModel()
