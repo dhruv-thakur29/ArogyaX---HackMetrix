@@ -25,7 +25,7 @@
 //
 // Run with: npx prisma db seed
 
-import { PrismaClient, TriageLevel, ReferralStatus } from "@prisma/client";
+import { PrismaClient, TriageLevel, ReferralStatus } from "../lib/db/generated/client";
 import bcrypt from "bcryptjs";
 
 const prisma = new PrismaClient();

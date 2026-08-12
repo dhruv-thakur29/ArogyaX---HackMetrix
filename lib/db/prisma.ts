@@ -8,7 +8,7 @@
 // Node.js `global` object in development, while always creating a
 // fresh instance in production.
 
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient } from "./generated/client";
 
 const globalForPrisma = global as unknown as { prisma?: PrismaClient };
 
